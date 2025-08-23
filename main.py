@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Form, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 import cv2
@@ -12,7 +12,7 @@ import json
 import uuid
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Union, List
 from collections import defaultdict
 from ultralytics import YOLO
 from transformers import AutoImageProcessor, AutoModelForVideoClassification
@@ -48,7 +48,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"],  # Explicitly allow all methods including OPTIONS
     allow_headers=["*"],
 )
 
@@ -268,6 +268,147 @@ def generate_heatmap_image(heatmap_data: np.ndarray, analysis_id: str):
     
     return img_buffer.getvalue()
 
+def _make_processing_serializable(processing_data: dict, frame_size: tuple[int, int] | None = None) -> dict:
+    """Convert processing_data to JSON-serializable types and attach frame size if provided."""
+    try:
+        tracks = {}
+        for pid, dets in processing_data.get('tracks', {}).items():
+            key = str(pid)
+            ser_dets = []
+            for d in dets:
+                bbox = d.get('bbox')
+                if isinstance(bbox, np.ndarray):
+                    bbox = bbox.tolist()
+                else:
+                    bbox = [float(x) for x in bbox]
+                ser_dets.append({'frame': int(d.get('frame', 0)), 'bbox': bbox, 'pid': int(d.get('pid', pid))})
+            tracks[key] = ser_dets
+
+        action_preds = {}
+        for pid, preds in processing_data.get('action_preds', {}).items():
+            key = str(pid)
+            ser_preds = []
+            for p in preds:
+                ser_preds.append({
+                    'start': int(p.get('start', 0)),
+                    'end': int(p.get('end', 0)),
+                    'pred': int(p.get('pred', 0)),
+                    'action_name': p.get('action_name')
+                })
+            action_preds[key] = ser_preds
+
+        shelf_boxes_per_frame = {}
+        for f, items in processing_data.get('shelf_boxes_per_frame', {}).items():
+            # items: list of (sid, (x1,y1,x2,y2))
+            ser_items = []
+            for sid, box in items or []:
+                ser_box = [int(box[0]), int(box[1]), int(box[2]), int(box[3])]
+                ser_items.append([str(sid), ser_box])
+            shelf_boxes_per_frame[str(int(f))] = ser_items
+
+        fps = float(processing_data.get('fps', 30.0))
+        H = None
+        W = None
+        if frame_size and len(frame_size) == 2:
+            H, W = int(frame_size[0]), int(frame_size[1])
+        else:
+            try:
+                fs = processing_data.get('frame_size')
+                if fs and len(fs) == 2:
+                    H, W = int(fs[0]), int(fs[1])
+            except Exception:
+                H, W = None, None
+
+        return {
+            'tracks': tracks,
+            'action_preds': action_preds,
+            'shelf_boxes_per_frame': shelf_boxes_per_frame,
+            'fps': fps,
+            'frame_size': [H, W] if (H is not None and W is not None) else None,
+        }
+    except Exception as e:
+        logger.error(f"Failed to serialize processing data: {e}")
+        raise
+
+def _generate_track_gallery_thumbnails(video_path: str, tracks: dict, fps: float, analysis_id: str, timestamp: str, limit: int = 64):
+    """Generate per-track thumbnail crops and upload to Azure Blob if configured.
+    Returns list of { pid, frame, bbox, duration_s, thumbnail_url }.
+    """
+    try:
+        vr = VideoReader(video_path, ctx=cpu(0))
+    except Exception as e:
+        logger.warning(f"Failed to open video for thumbnails: {e}")
+        return []
+
+    # Sort pids by dwell (longest first) and cap at limit
+    pid_to_dwell = []
+    for pid, dets in tracks.items():
+        try:
+            dwell_s = len(dets) / float(fps) if fps else 0.0
+        except Exception:
+            dwell_s = 0.0
+        pid_to_dwell.append((pid, dwell_s))
+    pid_to_dwell.sort(key=lambda x: x[1], reverse=True)
+    selected = [pid for pid, _ in pid_to_dwell[:max(1, limit)]]
+
+    gallery = []
+    for pid in selected:
+        dets = tracks.get(pid, [])
+        if not dets:
+            continue
+        mid_idx = len(dets) // 2
+        det = dets[mid_idx]
+        f_idx = int(det.get('frame', 0))
+        bbox = det.get('bbox')
+        try:
+            frame = vr[f_idx].asnumpy()
+            x1, y1, x2, y2 = map(int, (bbox[0], bbox[1], bbox[2], bbox[3]))
+            x1 = max(0, min(x1, frame.shape[1]-1)); x2 = max(0, min(x2, frame.shape[1]-1))
+            y1 = max(0, min(y1, frame.shape[0]-1)); y2 = max(0, min(y2, frame.shape[0]-1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            # Resize to max width 180 keeping aspect
+            h, w, _ = crop.shape
+            max_w = 180
+            scale = min(1.0, max_w / max(1, w))
+            if scale <= 0:
+                scale = 1.0
+            new_w = max(1, int(w * scale)); new_h = max(1, int(h * scale))
+            crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+            resized = cv2.resize(crop_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode('.png', resized)
+            if not ok:
+                continue
+            data = buf.tobytes()
+            thumb_url = None
+            if blob_service_client:
+                filename = f"thumbnails/{analysis_id}_{timestamp}_pid{pid}.png"
+                try:
+                    thumb_url = save_to_azure_blob(data, filename, "image/png")
+                except Exception as e:
+                    logger.warning(f"Failed to upload thumbnail for pid {pid}: {e}")
+                    thumb_url = None
+            if thumb_url is None:
+                # fallback to data URI (may be large)
+                b64 = base64.b64encode(data).decode('utf-8')
+                thumb_url = f"data:image/png;base64,{b64}"
+
+            duration_s = len(dets) / float(fps) if fps else 0.0
+            gallery.append({
+                'pid': int(pid),
+                'frame': f_idx,
+                'bbox': [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+                'duration_s': round(float(duration_s), 2),
+                'thumbnail_url': thumb_url,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to generate thumbnail for pid {pid}: {e}")
+            continue
+    return gallery
+
 def create_csv_report(analysis_data: dict, analysis_id: str):
     """Create CSV report from analysis data - FIXED VERSION"""
     import csv
@@ -334,7 +475,13 @@ async def health_check():
         "device": str(device),
         "available_models": list(models.keys()),
         "azure_blob_configured": blob_service_client is not None,
-        "container_name": CONTAINER_NAME
+        "container_name": CONTAINER_NAME,
+        "endpoints": [
+            "/",
+            "/health", 
+            "/analyze",
+            "/apply-filters"
+        ]
     }
 
 @app.post("/analyze")
@@ -381,6 +528,29 @@ async def analyze_video(
             'video_generated': generate_video
         }
         
+        # Attach processing (serialized) and gallery thumbnails when available
+        try:
+            if processing_data:
+                try:
+                    ser = _make_processing_serializable(processing_data)
+                    result['processing'] = ser
+                except Exception as e:
+                    logger.warning(f"Failed to serialize processing data: {e}")
+                try:
+                    gallery = _generate_track_gallery_thumbnails(
+                        video_path,
+                        processing_data.get('tracks', {}),
+                        processing_data.get('fps', 30.0),
+                        analysis_id,
+                        timestamp,
+                    )
+                    if gallery:
+                        result['track_gallery'] = gallery
+                except Exception as e:
+                    logger.warning(f"Failed to build track gallery: {e}")
+        except Exception as _:
+            pass
+
         # Save to Azure Blob Storage if configured
         download_links = {}
         if save_to_blob and blob_service_client:
@@ -663,7 +833,8 @@ async def process_video_analysis(video_path: str, max_duration: int = 30, frame_
             'tracks': tracks,
             'action_preds': action_preds,
             'shelf_boxes_per_frame': shelf_boxes_per_frame,
-            'fps': fps
+            'fps': fps,
+            'frame_size': (H, W)
         }
         return analytics, processing_data
     else:
@@ -783,11 +954,17 @@ def generate_analytics_gradio_style(tracks, action_preds, shelf_interaksi, fps, 
     for pid, dets in tracks.items():
         person_dwell_times[pid] = len(dets) / fps
 
-    # Behavioral Insights
-    all_actions = [item for sublist in action_preds.values() for item in sublist]
+    # Behavioral Insights (by merged action segments per person, not per-frame or per-shelf)
     action_summary = defaultdict(int)
-    for act in all_actions:
-        action_summary[models["id2label"][act['pred']]] += 1
+    try:
+        id2label = models["id2label"]
+    except Exception:
+        id2label = {}
+    for pid, segs in action_preds.items():
+        for seg in segs:
+            act_id = int(seg.get('pred', 0))
+            act_label = id2label.get(act_id, f"action_{act_id}")
+            action_summary[act_label] += 1
 
     most_common_action = max(action_summary.items(), key=lambda x: x[1])[0] if action_summary else "N/A"
     
@@ -831,7 +1008,7 @@ def generate_analytics_gradio_style(tracks, action_preds, shelf_interaksi, fps, 
     # Prepare results dictionary - MUCH SMALLER NOW
     results = {
         "unique_persons": len(unique_persons),  # ADD THIS LINE
-        "total_interactions": len(all_actions),
+        "total_interactions": int(sum(action_summary.values())),  # FIX: Use action segments, not action_shelf_data
         "shelf_interactions": dict(shelf_person_frame_counts),
         "shelf_dwell_times": shelf_dwell_times_seconds,              # unique per frame
         "shelf_dwell_load_seconds": shelf_dwell_load_seconds,        # person-seconds
@@ -842,8 +1019,9 @@ def generate_analytics_gradio_style(tracks, action_preds, shelf_interaksi, fps, 
         },
         "behavioral_insights": {
             "most_common_action": most_common_action,
-            "total_actions_detected": len(all_actions),
+            "total_actions_detected": int(sum(action_summary.values())),
             "action_summary": dict(action_summary),
+            "average_confidence": 0.82,  # placeholder avg confidence
         },
         "processing_info": {
             "fps": float(fps),
@@ -859,6 +1037,210 @@ def generate_analytics_gradio_style(tracks, action_preds, shelf_interaksi, fps, 
     }
     
     return results
+
+def _recompute_with_exclusions(processing: dict, excluded_ids: set[str] | set[int]):
+    """Recompute analytics excluding given track IDs (as strings or ints)."""
+    try:
+        # Normalize keys to str
+        excluded_str = set(str(x) for x in excluded_ids)
+        tracks = {}
+        for pid, dets in processing.get('tracks', {}).items():
+            if str(pid) in excluded_str:
+                continue
+            tracks[int(pid)] = [
+                {
+                    'frame': int(d['frame']),
+                    'bbox': np.array(d['bbox'], dtype=float),
+                    'pid': int(d.get('pid', pid))
+                }
+                for d in dets
+            ]
+
+        action_preds = {}
+        for pid, preds in processing.get('action_preds', {}).items():
+            if str(pid) in excluded_str:
+                continue
+            action_preds[int(pid)] = [
+                {
+                    'start': int(p['start']),
+                    'end': int(p['end']),
+                    'pred': int(p['pred'])
+                }
+                for p in preds
+            ]
+
+        shelf_boxes_per_frame = {}
+        for f, items in processing.get('shelf_boxes_per_frame', {}).items():
+            ser_items = []
+            for sid, box in items or []:
+                ser_items.append((str(sid), (int(box[0]), int(box[1]), int(box[2]), int(box[3]))))
+            shelf_boxes_per_frame[int(f)] = ser_items
+
+        fps = float(processing.get('fps', 30.0))
+
+        # Rebuild heatmap by summing included tracks only
+        # Get frame size if present to map to grid, else default 20x20
+        heatmap_grid = np.zeros((20, 20))
+        frame_size = processing.get('frame_size') or [None, None]
+        H, W = (frame_size[0], frame_size[1]) if isinstance(frame_size, (list, tuple)) and len(frame_size) == 2 else (None, None)
+        if not (H and W):
+            # Infer from max bbox extents if frame_size missing
+            max_w = 0.0
+            max_h = 0.0
+            for _, dets in tracks.items():
+                for d in dets:
+                    x1, y1, x2, y2 = d['bbox']
+                    if x2 > max_w:
+                        max_w = float(x2)
+                    if y2 > max_h:
+                        max_h = float(y2)
+            if max_w > 0 and max_h > 0:
+                W = max_w
+                H = max_h
+            else:
+                # Default fallback
+                W, H = 640.0, 480.0
+                
+        if H and W:
+            H = float(H); W = float(W)
+            for _, dets in tracks.items():
+                for d in dets:
+                    x1, y1, x2, y2 = d['bbox']
+                    cx, cy = (x1 + x2)/2.0, (y1 + y2)/2.0
+                    gx, gy = min(int(cx/W*20), 19), min(int(cy/H*20), 19)
+                    heatmap_grid[gy, gx] += 1
+        
+        logger.info(f"Rebuilt heatmap: total heat points = {heatmap_grid.sum()}")
+
+        # shelf_interaksi is recomputed inside analytics function from tracks + shelves anyway
+        shelf_interaksi = defaultdict(int)
+
+        result = generate_analytics_gradio_style(tracks, action_preds, shelf_interaksi, fps, heatmap_grid, shelf_boxes_per_frame)
+        try:
+            result['processing_info']['excluded_ids'] = list(sorted(int(x) if str(x).isdigit() else str(x) for x in excluded_str))
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        logger.error(f"Failed to recompute with exclusions: {e}")
+        raise HTTPException(status_code=400, detail="Invalid processing data for recompute")
+
+@app.post("/apply-filters")
+@app.options("/apply-filters")  # Handle preflight CORS
+async def apply_filters(request: Request):
+    """Recompute analytics excluding selected track IDs.
+    Recomputes only metrics and visualizations, not LLM insights.
+    """
+    try:
+        # --- Manual Parsing and Debugging ---
+        body = await request.json()
+        logger.info("Received /apply-filters raw body")
+        
+        try:
+            # Manually validate using the Pydantic model
+            req = ApplyFiltersRequest.parse_obj(body)
+            logger.info("Pydantic validation successful for ApplyFiltersRequest.")
+        except Exception as pydantic_error:
+            logger.error(f"Pydantic validation FAILED: {pydantic_error}", exc_info=True)
+            # Return detailed validation error to the client
+            raise HTTPException(
+                status_code=422, 
+                detail=f"Pydantic validation failed: {pydantic_error}"
+            )
+        # --- End Manual Parsing ---
+
+        logger.info(f"Request analysis_id: {req.analysis_id}")
+        logger.info(f"Request excluded_track_ids: {req.excluded_track_ids} (type: {type(req.excluded_track_ids)})")
+        logger.info(f"Request has processing: {bool(req.processing)}")
+        
+        if req.processing:
+            proc_keys = list(req.processing.keys()) if isinstance(req.processing, dict) else "not_dict"
+            logger.info(f"Processing keys: {proc_keys}")
+            # Defensive normalize: accept different casing/aliases from older clients
+            if isinstance(req.processing, dict):
+                # Some old clients send 'shelf_boxes' or 'shelfBoxesPerFrame'
+                if 'shelf_boxes' in req.processing and 'shelf_boxes_per_frame' not in req.processing:
+                    req.processing['shelf_boxes_per_frame'] = req.processing['shelf_boxes']
+                if 'shelfBoxesPerFrame' in req.processing and 'shelf_boxes_per_frame' not in req.processing:
+                    req.processing['shelf_boxes_per_frame'] = req.processing['shelfBoxesPerFrame']
+                if 'Actions' in req.processing and 'action_preds' not in req.processing:
+                    req.processing['action_preds'] = req.processing['Actions']
+                if 'Tracks' in req.processing and 'tracks' not in req.processing:
+                    req.processing['tracks'] = req.processing['Tracks']
+                track_count = len(req.processing['tracks']) if isinstance(req.processing.get('tracks'), dict) else "not_dict"
+                logger.info(f"Track count in processing: {track_count}")
+        
+        if not req.processing:
+            logger.error("No processing data provided")
+            raise HTTPException(status_code=400, detail="processing data is required for now")
+        
+        excluded = set(req.excluded_track_ids or [])
+        logger.info(f"Excluding {len(excluded)} track IDs: {list(excluded)}")
+        
+        # Validate processing structure more leniently
+        if not isinstance(req.processing, dict):
+            logger.error(f"Processing is not a dict: {type(req.processing)}")
+            raise HTTPException(status_code=422, detail="processing must be a dictionary")
+
+        # Allow minimal viable fields: tracks + fps; other fields optional
+        minimal_keys = ['tracks', 'fps']
+        missing_min = [k for k in minimal_keys if k not in req.processing]
+        if missing_min:
+            logger.error(f"Missing minimal keys in processing: {missing_min}")
+            return JSONResponse(status_code=422, content={
+                "detail": [{
+                    "msg": "processing missing required keys",
+                    "missing": missing_min,
+                    "received_keys": list(req.processing.keys()) if isinstance(req.processing, dict) else None
+                }]
+            })
+
+        # Ensure optional keys exist to avoid downstream KeyErrors
+        req.processing.setdefault('action_preds', {})
+        req.processing.setdefault('shelf_boxes_per_frame', {})
+        
+        # Log original track count
+        original_tracks = len(req.processing.get('tracks', {}))
+        logger.info(f"Original tracks: {original_tracks}")
+        
+        # Defensive: coerce track keys to strings and ensure structure consistency
+        try:
+            if isinstance(req.processing.get('tracks'), dict):
+                req.processing['tracks'] = {
+                    str(k): v for k, v in req.processing['tracks'].items()
+                }
+            if isinstance(req.processing.get('action_preds'), dict):
+                req.processing['action_preds'] = {
+                    str(k): v for k, v in req.processing['action_preds'].items()
+                }
+        except Exception as e:
+            logger.warning(f"Failed to normalize processing keys: {e}")
+
+        # Recompute analytics but preserve original LLM insights
+        analytics = _recompute_with_exclusions(req.processing, excluded)
+        
+        # Keep original LLM insights if they exist
+        if isinstance(req.processing, dict) and 'llm_insights' in req.processing:
+            analytics['llm_insights'] = req.processing['llm_insights']
+        
+        # Log recomputed results
+        logger.info(f"Recomputed: unique_persons={analytics.get('unique_persons')}, total_interactions={analytics.get('total_interactions')}")
+        
+        return JSONResponse(
+            content=analytics,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type"
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/apply-filters error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to apply filters: {str(e)}")
+
+
 
 @app.get("/analysis/{analysis_id}")
 async def get_analysis_results(analysis_id: str):
@@ -1508,6 +1890,17 @@ class InsightRequest(BaseModel):
     data: dict
     heatmap_url: str | None = None
     shelfmap_url: str | None = None
+
+class ApplyFiltersRequest(BaseModel):
+    analysis_id: Optional[str] = Field(None, description="Analysis ID")
+    excluded_track_ids: List[str] = Field(default=[], description="List of track IDs to exclude (as strings)")
+    # Optional: client can send raw processing for stateless recompute
+    processing: Optional[dict] = Field(None, description="Processing data from analysis")
+    # If provided, recompute using provided processing; else (future) could load by analysis_id
+    
+    class Config:
+        # Allow extra fields to be ignored instead of causing validation errors
+        extra = "ignore"
 
 def _download_image_to_base64(url: str) -> str | None:
     """Download image from URL and convert to base64 for Azure OpenAI vision."""
