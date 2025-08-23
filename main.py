@@ -1132,99 +1132,79 @@ async def apply_filters(request: Request):
     Recomputes only metrics and visualizations, not LLM insights.
     """
     try:
-        # --- Manual Parsing and Debugging ---
+        # Manually parse and validate to handle potential inconsistencies
         body = await request.json()
-        logger.info("Received /apply-filters raw body")
-        
         try:
-            # Manually validate using the Pydantic model
             req = ApplyFiltersRequest.parse_obj(body)
-            logger.info("Pydantic validation successful for ApplyFiltersRequest.")
         except Exception as pydantic_error:
-            logger.error(f"Pydantic validation FAILED: {pydantic_error}", exc_info=True)
-            # Return detailed validation error to the client
+            logger.error(f"Pydantic validation FAILED for /apply-filters: {pydantic_error}", exc_info=True)
             raise HTTPException(
                 status_code=422, 
-                detail=f"Pydantic validation failed: {pydantic_error}"
+                detail=f"Invalid payload structure: {pydantic_error}"
             )
-        # --- End Manual Parsing ---
 
-        logger.info(f"Request analysis_id: {req.analysis_id}")
-        logger.info(f"Request excluded_track_ids: {req.excluded_track_ids} (type: {type(req.excluded_track_ids)})")
-        logger.info(f"Request has processing: {bool(req.processing)}")
-        
-        if req.processing:
-            proc_keys = list(req.processing.keys()) if isinstance(req.processing, dict) else "not_dict"
-            logger.info(f"Processing keys: {proc_keys}")
-            # Defensive normalize: accept different casing/aliases from older clients
-            if isinstance(req.processing, dict):
-                # Some old clients send 'shelf_boxes' or 'shelfBoxesPerFrame'
-                if 'shelf_boxes' in req.processing and 'shelf_boxes_per_frame' not in req.processing:
-                    req.processing['shelf_boxes_per_frame'] = req.processing['shelf_boxes']
-                if 'shelfBoxesPerFrame' in req.processing and 'shelf_boxes_per_frame' not in req.processing:
-                    req.processing['shelf_boxes_per_frame'] = req.processing['shelfBoxesPerFrame']
-                if 'Actions' in req.processing and 'action_preds' not in req.processing:
-                    req.processing['action_preds'] = req.processing['Actions']
-                if 'Tracks' in req.processing and 'tracks' not in req.processing:
-                    req.processing['tracks'] = req.processing['Tracks']
-                track_count = len(req.processing['tracks']) if isinstance(req.processing.get('tracks'), dict) else "not_dict"
-                logger.info(f"Track count in processing: {track_count}")
-        
         if not req.processing:
-            logger.error("No processing data provided")
             raise HTTPException(status_code=400, detail="processing data is required for now")
         
         excluded = set(req.excluded_track_ids or [])
-        logger.info(f"Excluding {len(excluded)} track IDs: {list(excluded)}")
         
         # Validate processing structure more leniently
         if not isinstance(req.processing, dict):
-            logger.error(f"Processing is not a dict: {type(req.processing)}")
             raise HTTPException(status_code=422, detail="processing must be a dictionary")
 
         # Allow minimal viable fields: tracks + fps; other fields optional
         minimal_keys = ['tracks', 'fps']
         missing_min = [k for k in minimal_keys if k not in req.processing]
         if missing_min:
-            logger.error(f"Missing minimal keys in processing: {missing_min}")
             return JSONResponse(status_code=422, content={
-                "detail": [{
-                    "msg": "processing missing required keys",
-                    "missing": missing_min,
-                    "received_keys": list(req.processing.keys()) if isinstance(req.processing, dict) else None
-                }]
+                "detail": [{"msg": "processing missing required keys", "missing": missing_min}]
             })
 
         # Ensure optional keys exist to avoid downstream KeyErrors
         req.processing.setdefault('action_preds', {})
         req.processing.setdefault('shelf_boxes_per_frame', {})
         
-        # Log original track count
-        original_tracks = len(req.processing.get('tracks', {}))
-        logger.info(f"Original tracks: {original_tracks}")
-        
-        # Defensive: coerce track keys to strings and ensure structure consistency
+        # Defensive: coerce track keys to strings
         try:
             if isinstance(req.processing.get('tracks'), dict):
-                req.processing['tracks'] = {
-                    str(k): v for k, v in req.processing['tracks'].items()
-                }
+                req.processing['tracks'] = {str(k): v for k, v in req.processing['tracks'].items()}
             if isinstance(req.processing.get('action_preds'), dict):
-                req.processing['action_preds'] = {
-                    str(k): v for k, v in req.processing['action_preds'].items()
-                }
+                req.processing['action_preds'] = {str(k): v for k, v in req.processing['action_preds'].items()}
         except Exception as e:
             logger.warning(f"Failed to normalize processing keys: {e}")
 
-        # Recompute analytics but preserve original LLM insights
+        # Recompute analytics
         analytics = _recompute_with_exclusions(req.processing, excluded)
+        
+        # --- Generate new heatmap image from filtered data ---
+        if 'heatmap_data' in analytics:
+            try:
+                analysis_id = req.analysis_id or "filtered"
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                heatmap_bytes = generate_heatmap_image(np.array(analytics['heatmap_data']), analysis_id)
+                
+                new_heatmap_url = None
+                if blob_service_client:
+                    heatmap_filename = f"heatmaps/heatmap_{analysis_id}_{timestamp}_filtered.png"
+                    new_heatmap_url = save_to_azure_blob(heatmap_bytes, heatmap_filename, "image/png")
+                
+                if new_heatmap_url:
+                    analytics['download_links'] = {'heatmap_image': new_heatmap_url}
+                else:
+                    # Fallback to data URI if blob storage fails or is not configured
+                    heatmap_base64 = base64.b64encode(heatmap_bytes).decode('utf-8')
+                    analytics['download_links'] = {'heatmap_image': f"data:image/png;base64,{heatmap_base64}"}
+
+            except Exception as e:
+                logger.warning(f"Failed to generate new heatmap image on-the-fly: {e}")
+                analytics['download_links'] = {'heatmap_image': None} # Signal to frontend that image gen failed
         
         # Keep original LLM insights if they exist
         if isinstance(req.processing, dict) and 'llm_insights' in req.processing:
             analytics['llm_insights'] = req.processing['llm_insights']
         
-        # Log recomputed results
-        logger.info(f"Recomputed: unique_persons={analytics.get('unique_persons')}, total_interactions={analytics.get('total_interactions')}")
+        logger.info(f"Recomputed analytics excluding {len(excluded)} IDs.")
         
         return JSONResponse(
             content=analytics,
@@ -1239,8 +1219,6 @@ async def apply_filters(request: Request):
     except Exception as e:
         logger.error(f"/apply-filters error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to apply filters: {str(e)}")
-
-
 
 @app.get("/analysis/{analysis_id}")
 async def get_analysis_results(analysis_id: str):
