@@ -688,6 +688,7 @@ async def process_video_analysis(video_path: str, max_duration: int = 30, frame_
     raw_actions = defaultdict(list)
     heatmap_grid = np.zeros((20, 20))  # Use same grid size as Gradio
     shelf_boxes_per_frame = {}
+    frame_person_boxes = {} # Initialize for unique heatmap tracking
     shelf_last_box = {}
     next_shelf_idx = 1
     IOU_TH = 0.35
@@ -766,11 +767,26 @@ async def process_video_analysis(video_path: str, max_duration: int = 30, frame_
         if result.boxes.id is not None:
             boxes = result.boxes.xyxy.cpu().numpy()
             ids = result.boxes.id.int().cpu().tolist()
+            
+            # --- Heatmap unique presence tracking ---
+            # Track unique (pid, grid_cell) per second to make heatmap values more realistic
+            time_bucket = int(f_idx / fps) if fps > 0 else 0
+            if time_bucket not in frame_person_boxes:
+                frame_person_boxes[time_bucket] = set()
+            # --- End Heatmap tracking ---
+
             for box, pid in zip(boxes, ids):
                 tracks[pid].append({'frame': f_idx, 'bbox': box, 'pid': pid})
                 cx, cy = (box[0] + box[2])/2, (box[1] + box[3])/2
                 gx, gy = min(int(cx/W*20), 19), min(int(cy/H*20), 19)
-                heatmap_grid[gy, gx] += 1
+                
+                # Add unique presence to the current time bucket
+                frame_person_boxes[time_bucket].add((pid, (gx, gy)))
+    
+    # After Pass 1, build the final heatmap grid from unique presences
+    for time_bucket in frame_person_boxes.values():
+        for _, (gx, gy) in time_bucket:
+            heatmap_grid[gy, gx] += 1
     
     # Action Recognition (same logic as Gradio)
     # Stride controls how densely we sample clips for the action model
@@ -1880,6 +1896,14 @@ class ApplyFiltersRequest(BaseModel):
         # Allow extra fields to be ignored instead of causing validation errors
         extra = "ignore"
 
+class HeatmapInsightRequest(BaseModel):
+    heatmap_data: List[List[float]]
+    heatmap_url: Optional[str] = None
+    shelfmap_url: Optional[str] = None
+
+class DwellTimeInsightRequest(BaseModel):
+    dwell_data: List[dict] # e.g., [{"shelf": "shelf_1", "time": 12.3}, ...]
+
 def _download_image_to_base64(url: str) -> str | None:
     """Download image from URL and convert to base64 for Azure OpenAI vision."""
     try:
@@ -2228,6 +2252,117 @@ def ai_qa_stream(req: QARequest):
                 logger.error(f"AI QA stream failed: {first_err}; retry: {second_err}")
                 yield "Maaf, terjadi kendala menjawab saat ini."
     return StreamingResponse(gen(), media_type="text/plain")
+
+@app.post("/ai/heatmap-insight")
+async def ai_heatmap_insight(req: HeatmapInsightRequest):
+    client = _get_azure_client()
+    try:
+        # Prepare content for LLM
+        prompt = (
+            "Analisis data dan gambar heatmap berikut untuk mengidentifikasi pola alur lalu lintas utama pelanggan di dalam toko. Anda bisa melihat heatmap dan dihubungkan dengan screenshot cctnya, dimana ia masuk dan diidentikkan dengan heatmapnya. "
+            "Jelaskan polanya secara singkat dan berikan satu rekomendasi actionable. Jawaban harus dalam satu kalimat atau maksimal dua kalimat pendek. Jawab dalam Bahasa Indonesia."
+        )
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "text", "text": f"Data Grid Heatmap (nilai lebih tinggi berarti lebih ramai): {json.dumps(req.heatmap_data)}"},
+        ]
+
+        if req.heatmap_url:
+            base64_image = _download_image_to_base64(req.heatmap_url)
+            if base64_image:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+                })
+
+        if req.shelfmap_url:
+            base64_shelf = _download_image_to_base64(req.shelfmap_url)
+            if base64_shelf:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_shelf}"}
+                })
+
+        # Call LLM
+        resp = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "Anda adalah asisten analis retail yang cerdas dan ringkas."},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.3,
+            max_tokens=150,
+        )
+
+        insight = resp.choices[0].message.content or "Pola heatmap menunjukkan jalur utama pelanggan. Pertimbangkan untuk menempatkan produk dengan margin tinggi di sepanjang rute ini."
+
+        return {"insight": insight}
+
+    except Exception as e:
+        logger.error(f"AI heatmap insight error: {e}")
+        # Provide a safe fallback
+        fallback_insight = "Pola heatmap menunjukkan jalur utama pelanggan. Pertimbangkan untuk menempatkan produk dengan margin tinggi di sepanjang rute ini."
+        return {"insight": fallback_insight}
+
+@app.post("/ai/dwell-time-insight")
+async def ai_dwell_time_insight(req: DwellTimeInsightRequest):
+    client = _get_azure_client()
+    try:
+        prompt = (
+            "Berdasarkan data dwell time per rak berikut, berikan analisis dalam 4 poin terpisah (gunakan '\\n' sebagai pemisah). "
+            "Poin 1: Identifikasi rak dengan dwell time tertinggi (paling menarik) dan terendah (kurang menarik). "
+            "Poin 2: Berikan interpretasi bisnis dari temuan ini (misal, rak X sangat menarik, rak Y diabaikan). "
+            "Poin 3: Berikan satu rekomendasi untuk memanfaatkan rak populer. "
+            "Poin 4: Berikan satu rekomendasi untuk meningkatkan performa rak yang tidak populer. "
+            "Jawab dalam Bahasa Indonesia."
+        )
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "text", "text": f"Data Dwell Time (dalam detik): {json.dumps(req.dwell_data)}"},
+        ]
+
+        resp = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "Anda adalah asisten analis retail yang cerdas dan ringkas."},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.3,
+            max_tokens=200,
+        )
+
+        insight = resp.choices[0].message.content or "Rak teratas sangat menarik bagi pelanggan.\\nRak terbawah kurang mendapat perhatian.\\nLetakkan produk komplementer di dekat rak populer.\\nCoba ubah tata letak atau promosikan produk di rak yang sepi."
+        
+        # Post-process to clean up formatting from LLM
+        import re
+        # Remove markdown bolding
+        insight = insight.replace("**", "")
+        # Force newlines by replacing numberings like "1. ", "2. "
+        insight = re.sub(r'\s*\d+\.\s*', '\n', insight).strip()
+        
+        # Build bullet items robustly (prefer existing newlines; else split by numbering or sentences)
+        items = [seg.strip(' -•').strip() for seg in insight.split('\n') if seg.strip()]
+        if len(items) < 2:
+            numbered_parts = [p.strip() for p in re.split(r'\s*\d+\.\s*', insight) if p.strip()]
+            if len(numbered_parts) > len(items):
+                items = numbered_parts
+        if len(items) < 2:
+            sentence_parts = [p.strip() for p in re.split(r'(?<=[.!?])\s+', insight) if p.strip()]
+            if sentence_parts:
+                items = sentence_parts
+        # Limit to 4 concise items
+        items = items[:4]
+        
+        return {"insight": insight, "items": items}
+    except Exception as e:
+        logger.error(f"AI dwell time insight error: {e}")
+        fallback_insight = "Rak teratas sangat menarik bagi pelanggan.\\nRak terbawah kurang mendapat perhatian.\\nLetakkan produk komplementer di dekat rak populer.\\nCoba ubah tata letak atau promosikan produk di rak yang sepi."
+        return {"insight": fallback_insight, "items": [
+            "Rak teratas sangat menarik bagi pelanggan.",
+            "Rak terbawah kurang mendapat perhatian.",
+            "Letakkan produk komplementer di dekat rak populer.",
+            "Coba ubah tata letak atau promosikan produk di rak yang sepi."
+        ]}
 
 if __name__ == "__main__":
     import uvicorn
