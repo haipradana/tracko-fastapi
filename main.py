@@ -487,7 +487,7 @@ async def health_check():
 @app.post("/analyze")
 async def analyze_video(
     video: UploadFile = File(...),
-    max_duration: Optional[int] = Form(30),
+    max_duration: Optional[int] = Form(60),
     frame_skip_multiplier: Optional[float] = Form(1.0),
     save_to_blob: bool = Form(True),
     generate_video: bool = Form(True)
@@ -676,7 +676,7 @@ async def process_video_analysis(video_path: str, max_duration: int = 30, frame_
     tracker = models["person_model"].track(
         source=video_path, 
         persist=True, 
-        tracker='bytetrack.yaml',
+        tracker='tracker.yaml',
         classes=[0],  # person class
         stream=True,
         device=device,
