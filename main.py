@@ -2335,8 +2335,6 @@ async def ai_dwell_time_insight(req: DwellTimeInsightRequest):
         
         # Post-process to clean up formatting from LLM
         import re
-        # Remove markdown bolding
-        insight = insight.replace("**", "")
         # Force newlines by replacing numberings like "1. ", "2. "
         insight = re.sub(r'\s*\d+\.\s*', '\n', insight).strip()
         
