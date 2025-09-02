@@ -2564,6 +2564,96 @@ async def ai_heatmap_insight(req: HeatmapInsightRequest):
         fallback_insight = "Pola heatmap menunjukkan jalur utama pelanggan. Pertimbangkan untuk menempatkan produk dengan margin tinggi di sepanjang rute ini."
         return {"insight": fallback_insight}
 
+class ComparisonInsightRequest(BaseModel):
+    files_data: List[dict]  # List of file analysis data
+    
+@app.post("/comparison-insights")
+async def comparison_insights(req: ComparisonInsightRequest):
+    """Generate AI insights for comparison view with multiple files data and images."""
+    try:
+        # Prepare content for LLM
+        content = [{
+            "type": "text", 
+            "text": "Analisis dan bandingkan hasil analisis multiple toko ini. Berikan insight tentang perbedaan perilaku pelanggan, pola lalu lintas, dan rekomendasi untuk optimasi dalam bahasa Indonesia. Jawab dengan bahasa indonesia profesional dan ringkas. Anda adalah konsultan ahli analitik ritel. Analisis data perbandingan dan gambar berikut untuk memberikan insight yang dapat ditindaklanjuti terkait perbedaan perilaku pelanggan, variasi pola lalu lintas, serta rekomendasi spesifik untuk optimalisasi toko. anda juga bisa melihat gambar cctv kamera berikut untuk menghubungkan dengan heatmapnya, poisis di heatmap ini menunjukkan bagian asli apa di cctnyanya gitu anda bisa kembangkan sesuai gambarnya."
+        }]
+        
+        # Add text summary of all files
+        files_summary = []
+        for i, file_data in enumerate(req.files_data):
+            summary = f"""File {i+1} ({file_data.get('filename', f'File {i+1}')}):
+- Jumlah Pelanggan: {file_data.get('unique_persons', 0)}
+- Total Interaksi: {file_data.get('total_interactions', 0)}
+- Rata-rata Dwell Time: {file_data.get('avg_dwell_time', 0):.1f}s
+- Aksi Terbanyak: {file_data.get('top_action', 'N/A')}
+- Jumlah Rak: {file_data.get('shelves_count', 0)}"""
+            files_summary.append(summary)
+        
+        content[0]["text"] += "\n\n" + "\n\n".join(files_summary)
+        
+        # Convert and add heatmap images
+        for i, file_data in enumerate(req.files_data):
+            heatmap_url = file_data.get('heatmap_image')
+            if heatmap_url:
+                base64_heatmap = _download_image_to_base64(heatmap_url)
+                if base64_heatmap:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{base64_heatmap}"}
+                    })
+                    content.append({
+                        "type": "text",
+                        "text": f"Heatmap untuk File {i+1} ({file_data.get('filename', f'File {i+1}')})"
+                    })
+        
+        # Convert and add shelf map images
+        for i, file_data in enumerate(req.files_data):
+            shelf_map_url = file_data.get('shelf_map_image')
+            if shelf_map_url:
+                base64_shelf = _download_image_to_base64(shelf_map_url)
+                if base64_shelf:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{base64_shelf}"}
+                    })
+                    content.append({
+                        "type": "text",
+                        "text": f"Shelf Map untuk File {i+1} ({file_data.get('filename', f'File {i+1}')})"
+                    })
+        
+        messages = [
+            {
+                "role": "system", 
+                "content": "Jawab dengan bahasa indonesia profesional dan ringkas. Anda adalah konsultan ahli analitik ritel. Analisis data perbandingan dan gambar berikut untuk memberikan insight yang dapat ditindaklanjuti terkait perbedaan perilaku pelanggan, variasi pola lalu lintas, serta rekomendasi spesifik untuk optimalisasi toko. Fokus pada insight praktis berbasis data yang dapat langsung diterapkan oleh manajer toko. anda juga bisa melihat gambar cctv kamera berikut untuk melihat pola lalu lintas dan perilaku pelanggan. kasih juga visualisasi dari perbedaan itu.misal seperti apa sih bedanya..."
+            },
+            {"role": "user", "content": content}
+        ]
+        
+        # Call OpenAI API
+        client = _get_azure_client()
+        response = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=messages,
+            max_tokens=1500,
+            temperature=0.7
+        )
+        
+        insight_text = response.choices[0].message.content
+        
+        return {
+            "insight": insight_text,
+            "files_analyzed": len(req.files_data),
+            "images_processed": sum(1 for f in req.files_data if f.get('heatmap_image')) + sum(1 for f in req.files_data if f.get('shelf_map_image'))
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in comparison insights: {e}")
+        # Fallback insight
+        return {
+            "insight": "Berdasarkan data perbandingan, terlihat perbedaan pola lalu lintas dan perilaku pelanggan antar lokasi. Analisis lebih lanjut diperlukan untuk memberikan rekomendasi yang spesifik.",
+            "files_analyzed": len(req.files_data) if req.files_data else 0,
+            "images_processed": 0
+        }
+
 @app.post("/ai/dwell-time-insight")
 async def ai_dwell_time_insight(req: DwellTimeInsightRequest):
     client = _get_azure_client()
