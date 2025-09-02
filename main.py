@@ -484,6 +484,209 @@ async def health_check():
         ]
     }
 
+@app.post("/analyze-batch")
+async def analyze_batch(
+    videos: List[UploadFile] = File(...),
+    max_duration: Optional[int] = Form(60),
+    frame_skip_multiplier: Optional[float] = Form(1.0),
+    save_to_blob: bool = Form(True),
+    generate_video: bool = Form(True)
+):
+    """Analyze multiple retail videos for customer behavior with batch processing"""
+    
+    if not videos or len(videos) == 0:
+        raise HTTPException(status_code=400, detail="No videos provided")
+    
+    # Validate all files
+    for video in videos:
+        if not video.filename.lower().endswith(('.mp4', '.avi', '.mov', '.webm')):
+            raise HTTPException(status_code=400, detail=f"File {video.filename} is not a supported video format")
+    
+    # Generate unique batch ID
+    batch_id = str(uuid.uuid4())
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    try:
+        logger.info(f"Starting batch analysis {batch_id} for {len(videos)} videos")
+        
+        individual_results = []
+        temp_files = []
+        
+        # Process each video individually
+        for i, video in enumerate(videos):
+            logger.info(f"Processing video {i+1}/{len(videos)}: {video.filename}")
+            
+            # Save uploaded video temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+                content = await video.read()
+                tmp_file.write(content)
+                video_path = tmp_file.name
+                temp_files.append(video_path)
+            
+            # Process individual video
+            if generate_video:
+                result, processing_data = await process_video_analysis(video_path, max_duration, frame_skip_multiplier, generate_video=True)
+            else:
+                result = await process_video_analysis(video_path, max_duration, frame_skip_multiplier, generate_video=False)
+                processing_data = None
+            
+            # Add batch metadata to individual result
+            if 'metadata' not in result or result['metadata'] is None:
+                result['metadata'] = {}
+            
+            result['metadata'].update({
+                'batch_id': batch_id,
+                'file_index': i,
+                'total_files': len(videos),
+                'batch_timestamp': timestamp
+            })
+            
+            # Generate download_links for individual file in batch
+            download_links = {}
+            if save_to_blob and blob_service_client:
+                try:
+                    file_analysis_id = f"{batch_id}_file{i}"
+                    
+                    # Save JSON results
+                    json_data = json.dumps(result, indent=2).encode('utf-8')
+                    json_filename = f"analyses/{file_analysis_id}_{timestamp}.json"
+                    download_links['json_results'] = save_to_azure_blob(json_data, json_filename, "application/json")
+                    
+                    # Generate and save heatmap
+                    if 'heatmap_data' in result:
+                        heatmap_bytes = generate_heatmap_image(result['heatmap_data'], file_analysis_id)
+                        heatmap_filename = f"heatmaps/heatmap_{file_analysis_id}_{timestamp}.png"
+                        download_links['heatmap_image'] = save_to_azure_blob(heatmap_bytes, heatmap_filename, "image/png")
+                    
+                    # Generate and save shelf map images
+                    try:
+                        shelf_map_images: list[str] = []
+                        if processing_data:
+                            top_images = generate_shelf_map_images(
+                                video_path,
+                                processing_data.get('shelf_boxes_per_frame', {}),
+                                file_analysis_id,
+                                top_k=3,
+                            )
+                            for idx, (f_idx, img_bytes) in enumerate(top_images):
+                                shelfmap_filename = f"shelfmaps/shelfmap_{file_analysis_id}_{timestamp}_f{f_idx}_{idx+1}.png"
+                                url = save_to_azure_blob(img_bytes, shelfmap_filename, "image/png")
+                                shelf_map_images.append(url)
+                        if shelf_map_images:
+                            download_links['shelf_map_images'] = shelf_map_images
+                            download_links['shelf_map_image'] = shelf_map_images[0]
+                    except Exception as e:
+                        logger.warning(f"Shelf map generation failed for {video.filename}: {e}")
+                    
+                    # Generate annotated video if requested
+                    if generate_video and processing_data:
+                        try:
+                            video_bytes = generate_annotated_video_like_gradio(
+                                video_path,
+                                processing_data['tracks'],
+                                processing_data['action_preds'], 
+                                processing_data['shelf_boxes_per_frame'],
+                                file_analysis_id,
+                                processing_data['fps'],
+                                max_duration
+                            )
+                            if video_bytes:
+                                video_filename = f"videos/annotated_{file_analysis_id}_{timestamp}.mp4"
+                                download_links['annotated_video_download'] = save_to_azure_blob(video_bytes, video_filename, "video/mp4")
+                                download_links['annotated_video_blob_path'] = video_filename
+                                download_links['annotated_video_stream'] = f"/stream?blob={quote(video_filename)}"
+                        except Exception as e:
+                            logger.warning(f"Failed to generate annotated video for {video.filename}: {e}")
+                    
+                    result['download_links'] = download_links
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to save download_links for {video.filename}: {e}")
+                    result['download_links'] = None
+            
+            # Attach processing data if available
+            if processing_data:
+                try:
+                    ser = _make_processing_serializable(processing_data)
+                    result['processing'] = ser
+                except Exception as e:
+                    logger.warning(f"Failed to serialize processing data for {video.filename}: {e}")
+                
+                try:
+                    gallery = _generate_track_gallery_thumbnails(
+                        video_path,
+                        processing_data.get('tracks', {}),
+                        processing_data.get('fps', 30.0),
+                        f"{batch_id}_file{i}",
+                        timestamp,
+                    )
+                    if gallery:
+                        result['track_gallery'] = gallery
+                except Exception as e:
+                    logger.warning(f"Failed to build track gallery for {video.filename}: {e}")
+            
+            individual_results.append(result)
+        
+        # Generate aggregate metrics
+        aggregate_metrics = calculate_aggregate_metrics(individual_results)
+        
+        # Create batch result
+        batch_result = {
+            'analysis_type': 'batch_analysis',
+            'batch_id': batch_id,
+            'total_files': len(videos),
+            'individual_results': individual_results,
+            'aggregate_metrics': aggregate_metrics,
+            'batch_metadata': {
+                'timestamp': datetime.now().isoformat(),
+                'processing_time': 0,  # Will be calculated
+                'files_info': [
+                    {
+                        'filename': result.get('metadata', {}).get('original_filename', 'unknown'),
+                        'file_size': result.get('metadata', {}).get('file_size', 0),
+                        'analysis_id': result.get('metadata', {}).get('analysis_id', 'unknown')
+                    }
+                    for result in individual_results
+                ]
+            }
+        }
+        
+        # Save to Azure Blob Storage if configured
+        if save_to_blob and blob_service_client:
+            try:
+                # Save batch JSON results
+                json_data = json.dumps(batch_result, indent=2).encode('utf-8')
+                json_filename = f"batch_analyses/batch_{batch_id}_{timestamp}.json"
+                batch_result['download_links'] = {
+                    'batch_json_results': save_to_azure_blob(json_data, json_filename, "application/json")
+                }
+                
+                logger.info(f"Batch analysis {batch_id} saved to Azure Blob Storage")
+                
+            except Exception as e:
+                logger.error(f"Failed to save batch to Azure Blob: {e}")
+                batch_result['storage_error'] = str(e)
+        
+        # Clean up temporary files
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+        
+        logger.info(f"Batch analysis {batch_id} completed successfully")
+        return JSONResponse(content=batch_result)
+        
+    except Exception as e:
+        logger.error(f"Batch analysis {batch_id} failed: {e}")
+        # Clean up on error
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Batch processing failed: {str(e)}")
+
 @app.post("/analyze")
 async def analyze_video(
     video: UploadFile = File(...),
@@ -855,6 +1058,63 @@ async def process_video_analysis(video_path: str, max_duration: int = 30, frame_
         return analytics, processing_data
     else:
         return analytics
+
+def calculate_aggregate_metrics(individual_results: List[dict]) -> dict:
+    """Calculate aggregate metrics from multiple analysis results without spatial data merging"""
+    try:
+        if not individual_results:
+            return {}
+        
+        # Aggregate basic metrics
+        total_unique_persons = sum(r.get('unique_persons', 0) for r in individual_results)
+        total_interactions = sum(r.get('total_interactions', 0) for r in individual_results)
+        
+        # Calculate average dwell time across all videos
+        dwell_times = [r.get('dwell_time_analysis', {}).get('average_dwell_time', 0) for r in individual_results]
+        average_dwell_time_across_videos = sum(dwell_times) / len(dwell_times) if dwell_times else 0
+        
+        # Find most common action overall
+        action_counts = defaultdict(int)
+        for result in individual_results:
+            action_summary = result.get('action_summary', {})
+            for action, count in action_summary.items():
+                action_counts[action] += count
+        
+        most_common_action_overall = max(action_counts.items(), key=lambda x: x[1])[0] if action_counts else "N/A"
+        
+        # Calculate total analysis duration
+        total_analysis_duration = sum(r.get('metadata', {}).get('max_duration', 0) for r in individual_results)
+        
+        return {
+            'total_unique_persons': total_unique_persons,
+            'total_interactions': total_interactions,
+            'average_dwell_time_across_videos': round(average_dwell_time_across_videos, 2),
+            'most_common_action_overall': most_common_action_overall,
+            'total_analysis_duration': total_analysis_duration,
+            'files_analyzed': len(individual_results),
+            'action_distribution': dict(action_counts),
+            'per_file_summary': [
+                {
+                    'filename': r.get('metadata', {}).get('original_filename', 'unknown'),
+                    'unique_persons': r.get('unique_persons', 0),
+                    'total_interactions': r.get('total_interactions', 0),
+                    'avg_dwell_time': r.get('dwell_time_analysis', {}).get('average_dwell_time', 0),
+                    'most_common_action': r.get('behavioral_insights', {}).get('most_common_action', 'N/A')
+                }
+                for r in individual_results
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error calculating aggregate metrics: {e}")
+        return {
+            'total_unique_persons': 0,
+            'total_interactions': 0,
+            'average_dwell_time_across_videos': 0,
+            'most_common_action_overall': 'N/A',
+            'total_analysis_duration': 0,
+            'files_analyzed': len(individual_results) if individual_results else 0,
+            'error': str(e)
+        }
 
 def generate_analytics_gradio_style(tracks, action_preds, shelf_interaksi, fps, heatmap_grid, shelf_boxes_per_frame):
     """Generate analytics with optimized action_shelf_mapping (reduced redundancy)"""
