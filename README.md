@@ -66,12 +66,12 @@ notepad .env  # Windows
 
 Edit `.env`:
 ```env
-AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=yourstorageaccount;AccountKey=yourstoragekey;EndpointSuffix=core.windows.net
-AZURE_STORAGE_CONTAINER=retail-analysis-results
+AZURE_STORAGE_CONNECTION_STRING=<your-connection-string>
+AZURE_STORAGE_CONTAINER=<your-container-name>
 
 # Azure OpenAI (Optional - for AI insights)
-AZURE_OPENAI_ENDPOINT=https://your-openai-resource.openai.azure.com/
-AZURE_OPENAI_KEY=your-openai-key
+AZURE_OPENAI_ENDPOINT=<your-endpoint>
+AZURE_OPENAI_KEY=<your-openai-key>
 AZURE_OPENAI_DEPLOYMENT=gpt-4
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
 ```
