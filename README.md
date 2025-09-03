@@ -1,38 +1,41 @@
-# Retail Behavior Analysis FastAPI
+# FastAPI Backend for TRACKO
 
-FastAPI-based retail customer behavior analysis with ML models and Azure Blob Storage integration.
+Backend infrastructure for Tracko.tech - A comprehensive retail analytics platform powered by FastAPI, featuring real-time customer behavior analysis, computer vision processing, and seamless cloud storage integration.
 
-## 🚀 Features
+## Features
 
-- **Video Upload & Processing**: Upload retail surveillance videos
-- **Real-time Analysis**: AI-powered customer behavior analysis
-- **Azure Blob Storage**: Cloud storage for results, heatmaps, and reports
-- **Multiple Models**: YOLO person detection, shelf segmentation, action classification
-- **Heatmap Generation**: Customer traffic visualization
-- **CSV Reports**: Detailed analytics export
-- **RESTful API**: Easy integration with web applications
+- **Video Processing API**: Process and analyze retail CCTV video streams
+- **Customer Analytics Engine**: Real-time AI analysis of customer behavior patterns
+- **Storage Integration**: Flexible storage system supporting both Azure Blob and local storage
+- **Computer Vision Pipeline**: 
+  - **Person Detection and Tracking**: YOLO + BotSORT + ReID for accurate person detection and tracking
+  - **Shelf Interaction Analysis**: YOLO + Shelf Segmentation for identifying customer interactions
+  - **Customer Action Classification**: VideoMAE  model for classifying customer actions
+- **Analytics Visualization**: Generate heatmaps showing customer movement patterns
+- **Data Export API**: Export analyzed data in CSV format for further processing
+- **RESTful Endpoints**: Documented API endpoints for frontend integration
 
-## 🛠 Technology Stack
+## Technology Stack
 
 - **FastAPI** - Modern Python web framework
 - **PyTorch** - Deep learning framework
-- **Ultralytics YOLO** - Object detection
-- **Transformers** - Action classification
+- **Ultralytics YOLO** - Object detection and Shelf Segmentation
+- **VideoMAE** - Action classification
 - **Azure Blob Storage** - Cloud storage
 - **Docker** - Containerization
 
-## 📋 Prerequisites
+## Prerequisites
 
 - Python 3.9+
-- Azure Storage Account
+- Azure Storage Account (or Local Storage)
 - Docker (optional)
 
-## 🚀 Quick Start
+## Installation
 
 ### 1. Clone and Setup
 
 ```bash
-git clone <your-repo>
+git clone https://github.com/haipradana/tracko-fastapi.git
 cd fastapi-app
 ```
 
@@ -48,19 +51,50 @@ pip install -r requirements.txt
 python scripts/download_models.py
 ```
 
-### 4. Configure Azure Blob Storage
+#### Step 4a: Configure Azure Blob Storage (Optional)
 
-Copy environment file and configure:
+If you want to use Azure Blob Storage for cloud storage:
 
 ```bash
-cp env.example .env
+# Copy environment template
+cp .env.example .env
+
+# Edit .env file with your Azure configurations
+notepad .env  # Windows
+# nano .env    # Linux/Mac
 ```
 
 Edit `.env`:
 ```env
 AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=yourstorageaccount;AccountKey=yourstoragekey;EndpointSuffix=core.windows.net
 AZURE_STORAGE_CONTAINER=retail-analysis-results
+
+# Azure OpenAI (Optional - for AI insights)
+AZURE_OPENAI_ENDPOINT=https://your-openai-resource.openai.azure.com/
+AZURE_OPENAI_KEY=your-openai-key
+AZURE_OPENAI_DEPLOYMENT=gpt-4
+AZURE_OPENAI_API_VERSION=2024-12-01-preview
 ```
+
+#### Step 4b: Use Local Storage (Recommended for Local Development)
+
+If you want to use local storage (no Azure configuration needed):
+
+```bash
+# Option 1: Skip .env file creation entirely
+# The system will automatically use local storage
+
+# Option 2: Create empty .env file
+touch .env  # Linux/Mac
+type nul > .env  # Windows
+
+# Option 3: Create .env with local storage settings
+echo "# Using local storage - no Azure configuration needed" > .env
+echo "AZURE_STORAGE_CONNECTION_STRING=" >> .env
+echo "AZURE_STORAGE_CONTAINER=retail-analysis-results" >> .env
+```
+
+**Note**: With local storage, all results (heatmaps, CSV reports, analysis data) will be saved in local directories and served as base64 data URIs.
 
 ### 5. Run FastAPI
 
@@ -164,4 +198,4 @@ For issues and questions:
 
 ## 📄 License
 
-This project is licensed under the MIT License. 
+This project is licensed under the MIT License.
